@@ -1987,12 +1987,41 @@ end)
 
 CreateButton(TabContents.Combat, "Kill All (Rocket)", "Requires Rocket Launcher", function()
     local rocket = LP.Backpack:FindFirstChild("RocketLauncher") or LP.Character:FindFirstChild("RocketLauncher")
-    if rocket then
-        rocket.Parent = LP.Character
-        for _,p in pairs(Players:GetPlayers()) do
-            if p~=LP and p.Character then pcall(function() rocket.fire:FireServer(p.Character.HumanoidRootPart.Position) end) end
+    if not rocket then
+        game:GetService("StarterGui"):SetCore("SendNotification",{Title="Ошибка",Text="Rocket Launcher не найден!",Duration=3})
+        return
+    end
+    rocket.Parent = LP.Character
+    task.wait(0.1)
+    for _, p in pairs(Players:GetPlayers()) do
+        if p ~= LP and p.Character then
+            local targetRoot = p.Character:FindFirstChild("HumanoidRootPart")
+            if targetRoot then
+                pcall(function()
+                    local myRoot = LP.Character:FindFirstChild("HumanoidRootPart")
+                    if not myRoot then return end
+                    local savedCFrame = myRoot.CFrame
+                    -- Отходим далеко от цели перед выстрелом чтобы не взорвало нас
+                    myRoot.CFrame = targetRoot.CFrame * CFrame.new(0, 0, 200)
+                    task.wait(0.05)
+                    -- Ищем все возможные remotes
+                    local remoteNames = {"fire","Fire","shoot","Shoot","Launch","launch","remote","Remote"}
+                    for _, rName in pairs(remoteNames) do
+                        local rem = rocket:FindFirstChild(rName)
+                        if rem and rem:IsA("RemoteEvent") then
+                            rem:FireServer(targetRoot.Position + Vector3.new(0,3,0))
+                            break
+                        end
+                    end
+                    task.wait(0.05)
+                    myRoot.CFrame = savedCFrame
+                end)
+                task.wait(0.15)
+            end
         end
     end
+    task.wait(0.5)
+    pcall(function() rocket.Parent = LP.Backpack end)
 end)
 
 CreateButton(TabContents.Combat, "Kill All (Snowball)", "Equip Snowball first", function()
@@ -2005,15 +2034,79 @@ CreateButton(TabContents.Combat, "Kill All (Snowball)", "Equip Snowball first", 
 end)
 
 CreateButton(TabContents.Combat, "Freeze All", "Requires Freeze Ray", function()
-    local f = LP.Backpack:FindFirstChild("Freeze Ray") or LP.Character:FindFirstChild("Freeze Ray")
-    if f then
-        f.Parent = LP.Character
-        for _,p in pairs(Players:GetPlayers()) do
-            if p~=LP and p.Character then pcall(function() f.fire:FireServer(p.Character.HumanoidRootPart) end) end
+    -- Ищем Freeze Ray по разным названиям
+    local freeze = nil
+    local freezeNames = {"Freeze Ray","FreezeRay","Freeze","Ice Ray","IceRay","freeze_ray"}
+    for _, fname in pairs(freezeNames) do
+        freeze = LP.Backpack:FindFirstChild(fname) or LP.Character:FindFirstChild(fname)
+        if freeze then break end
+    end
+
+    if not freeze then
+        game:GetService("StarterGui"):SetCore("SendNotification",{Title="Ошибка",Text="Freeze Ray не найден!",Duration=3})
+        return
+    end
+
+    freeze.Parent = LP.Character
+    task.wait(0.1)
+
+    local frozenCount = 0
+
+    for _, p in pairs(Players:GetPlayers()) do
+        if p ~= LP and p.Character then
+            local targetRoot = p.Character:FindFirstChild("HumanoidRootPart")
+            local targetHum = p.Character:FindFirstChildOfClass("Humanoid")
+
+            if targetRoot and targetHum and targetHum.Health > 0 then
+                pcall(function()
+                    -- Пробуем все возможные названия remote
+                    local remoteNames = {
+                        "fire","Fire","shoot","Shoot",
+                        "freeze","Freeze","activate","Activate",
+                        "remote","Remote","event","Event","Cast","cast"
+                    }
+                    local fired = false
+                    for _, rName in pairs(remoteNames) do
+                        local rem = freeze:FindFirstChild(rName)
+                        if rem then
+                            if rem:IsA("RemoteEvent") then
+                                rem:FireServer(targetRoot)
+                                rem:FireServer(targetRoot.Position)
+                                fired = true
+                                break
+                            elseif rem:IsA("RemoteFunction") then
+                                pcall(function() rem:InvokeServer(targetRoot) end)
+                                fired = true
+                                break
+                            end
+                        end
+                    end
+                    -- Если не нашли remote — ищем глубже
+                    if not fired then
+                        for _, desc in pairs(freeze:GetDescendants()) do
+                            if desc:IsA("RemoteEvent") then
+                                desc:FireServer(targetRoot)
+                                desc:FireServer(targetRoot.Position)
+                                break
+                            end
+                        end
+                    end
+                end)
+                frozenCount = frozenCount + 1
+                task.wait(0.05)
+            end
         end
     end
-end)
 
+    game:GetService("StarterGui"):SetCore("SendNotification",{
+        Title="Freeze All",
+        Text="Заморожено "..frozenCount.." игроков",
+        Duration=3
+    })
+
+    task.wait(0.3)
+    pcall(function() freeze.Parent = LP.Backpack end)
+end)
 CreateToggle(TabContents.Combat, "NoCooldown Blade", "Dueling sword no cooldown", function(s)
     State.NoCooldownBlade = s
     if s then task.spawn(NoCooldownBlade) end

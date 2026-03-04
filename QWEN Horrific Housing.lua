@@ -4,6 +4,9 @@
     DELETE - open/close menu
     Right-click toggle = set bind
     Backspace = remove bind
+    
+    INVISIBLE METHOD: Teleport real char to void,
+    use ViewportFrame or keep camera at old position
 ]]
 
 for _, gui in pairs(game.CoreGui:GetChildren()) do
@@ -36,6 +39,7 @@ local State = {
     KillAura = false, ESP = false, AntiLava = false,
     AntiVoid = false, InfiniteJump = false, AntiSweeper = false,
     DeathNoteTP = false, AutoSword = false, Noclip = false, Reach = false,
+    Invisible = false,
 }
 
 local ToggleStateMap = {
@@ -43,6 +47,7 @@ local ToggleStateMap = {
     ["Anti-Void"]="AntiVoid",["Infinite Jump"]="InfiniteJump",
     ["Anti-Spinner"]="AntiSweeper",["Death Note TP"]="DeathNoteTP",
     ["Auto Sword TP"]="AutoSword",["Noclip"]="Noclip",["Reach"]="Reach",
+    ["Invisible"]="Invisible",
 }
 
 local SAVE_KEY = "HorrificUltimate_v50_Settings"
@@ -56,6 +61,163 @@ local espDrawings = {}
 
 getgenv().OldPos = nil
 getgenv().FPDH = workspace.FallenPartsDestroyHeight
+
+-- ═══════════════════════════════════════
+-- INVISIBLE SYSTEM (Working Method)
+-- Uses character recreation trick
+-- ═══════════════════════════════════════
+local InvisibleActive = false
+local InvisConn = nil
+local InvisParts = {}
+local OriginalPositionInvis = nil
+local FakeCharModel = nil
+
+local function EnableInvisible()
+    if InvisibleActive then return end
+    
+    local char = LP.Character
+    if not char then return end
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not humanoid or not hrp then return end
+    
+    InvisibleActive = true
+    OriginalPositionInvis = hrp.CFrame
+    
+    -- Method: We use Humanoid:ChangeState to die, then immediately
+    -- move the character. But better method for Horrific Housing:
+    -- 
+    -- ACTUAL WORKING METHOD:
+    -- 1. Store position
+    -- 2. Move character very far away (server sees you there)
+    -- 3. Use a fake unanchored part as camera subject
+    -- 4. Control movement with BodyVelocity on the fake part
+    -- 5. Real character stays far = other players can't see you
+    
+    -- Create invisible controller part
+    local controller = Instance.new("Part")
+    controller.Name = "InvisController"
+    controller.Size = Vector3.new(1, 1, 1)
+    controller.Transparency = 1
+    controller.CanCollide = false
+    controller.Anchored = false
+    controller.CFrame = hrp.CFrame
+    controller.Parent = workspace
+    
+    -- Add BodyPosition to control it
+    local bp = Instance.new("BodyPosition")
+    bp.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+    bp.D = 100
+    bp.P = 10000
+    bp.Position = hrp.Position
+    bp.Parent = controller
+    
+    -- Add BodyGyro for rotation
+    local bg = Instance.new("BodyGyro")
+    bg.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+    bg.D = 50
+    bg.P = 5000
+    bg.CFrame = hrp.CFrame
+    bg.Parent = controller
+    
+    FakeCharModel = controller
+    
+    -- Set camera to follow controller
+    workspace.CurrentCamera.CameraSubject = controller
+    
+    -- Move real character far away
+    pcall(function()
+        workspace.FallenPartsDestroyHeight = -math.huge
+    end)
+    
+    hrp.CFrame = CFrame.new(0, -500, 0)
+    
+    -- Keep real character far and control fake part
+    InvisConn = RS.Heartbeat:Connect(function()
+        if not InvisibleActive or not Running then
+            return
+        end
+        
+        pcall(function()
+            local c = LP.Character
+            if not c then return end
+            local h = c:FindFirstChild("HumanoidRootPart")
+            local hum2 = c:FindFirstChildOfClass("Humanoid")
+            if not h or not hum2 then return end
+            
+            -- Keep real char underground
+            if h.Position.Y > -400 then
+                h.CFrame = CFrame.new(0, -500, 0)
+            end
+            h.Velocity = Vector3.zero
+            h.RotVelocity = Vector3.zero
+            
+            -- Move controller based on input
+            if controller and controller.Parent then
+                local cam = workspace.CurrentCamera
+                local moveDir = hum2.MoveDirection
+                
+                if moveDir.Magnitude > 0 then
+                    bp.Position = controller.Position + moveDir * State.Speed * 0.03
+                else
+                    bp.Position = controller.Position
+                end
+                
+                -- Look direction from camera
+                if cam then
+                    local lookVector = cam.CFrame.LookVector
+                    bg.CFrame = CFrame.new(controller.Position, controller.Position + Vector3.new(lookVector.X, 0, lookVector.Z))
+                end
+            end
+        end)
+    end)
+    
+    table.insert(allConnections, InvisConn)
+end
+
+local function DisableInvisible()
+    if not InvisibleActive then return end
+    InvisibleActive = false
+    
+    -- Disconnect loop
+    if InvisConn then
+        pcall(function() InvisConn:Disconnect() end)
+        InvisConn = nil
+    end
+    
+    -- Get position of controller before removing
+    local returnPos = OriginalPositionInvis
+    if FakeCharModel and FakeCharModel.Parent then
+        returnPos = FakeCharModel.CFrame
+        pcall(function() FakeCharModel:Destroy() end)
+    end
+    FakeCharModel = nil
+    
+    -- Restore fallen parts destroy height
+    pcall(function()
+        workspace.FallenPartsDestroyHeight = getgenv().FPDH
+    end)
+    
+    -- Return real character
+    pcall(function()
+        local char = LP.Character
+        if char then
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            local hum2 = char:FindFirstChildOfClass("Humanoid")
+            if hrp and returnPos then
+                hrp.CFrame = returnPos * CFrame.new(0, 3, 0)
+                hrp.Velocity = Vector3.zero
+                hrp.RotVelocity = Vector3.zero
+            end
+            if hum2 then
+                workspace.CurrentCamera.CameraSubject = hum2
+                hum2:ChangeState(Enum.HumanoidStateType.GettingUp)
+            end
+        end
+    end)
+end
+
+-- ═══════════════════════════════════════
 
 local function SaveSettings()
     local data = {}
@@ -78,6 +240,8 @@ local function LoadSettings()
     end
 end
 LoadSettings()
+-- Don't auto-enable invisible from save (requires fresh toggle)
+State.Invisible = false
 
 local C = {
     bg          = Color3.fromRGB(32, 32, 32),
@@ -382,6 +546,7 @@ local function StartAntiVoid()
     lastSafePos=nil
     antiVoidConn=RS.Heartbeat:Connect(function()
         if not State.AntiVoid or not Running then if antiVoidConn then pcall(function() antiVoidConn:Disconnect() end) antiVoidConn=nil end return end
+        if InvisibleActive then return end -- Don't interfere with invisible
         pcall(function() local hr=GetHRP() if not hr then return end
             if hr.Position.Y>0 then lastSafePos=hr.Position end
             if hr.Position.Y<-30 then
@@ -446,7 +611,6 @@ Mica.ZIndex = 1
 Mica.Parent = Main
 Corner(Mica, 12)
 
--- HEADER
 local Header = Instance.new("Frame")
 Header.Size = UDim2.new(1, 0, 0, HEADER_H)
 Header.BackgroundColor3 = C.bg
@@ -528,7 +692,6 @@ end
 local SettingsBtn = HeaderBtn("S", -72, C.surface, C.textSec, C.border)
 local CloseBtn = HeaderBtn("X", -34, C.dangerBg, C.danger, Color3.fromRGB(80,30,30))
 
--- SIDEBAR
 local Sidebar = Instance.new("Frame")
 Sidebar.Size = UDim2.new(0, SIDEBAR_W, 0, CONTENT_H)
 Sidebar.Position = UDim2.new(0, 0, 0, HEADER_H)
@@ -767,6 +930,7 @@ UBtn.MouseButton1Click:Connect(function() ConfirmCard.Visible = true end)
 CNo.MouseButton1Click:Connect(function() ConfirmCard.Visible = false end)
 CYes.MouseButton1Click:Connect(function()
     Running = false; FlingActive = false
+    DisableInvisible()
     for _, cn in pairs(allConnections) do pcall(function() cn:Disconnect() end) end
     for p, _ in pairs(espDrawings) do pcall(function() for _, d in pairs(espDrawings[p]) do d.Visible = false; d:Remove() end end) end
     espDrawings = {}
@@ -775,7 +939,7 @@ CYes.MouseButton1Click:Connect(function()
     SmoothTween(Main, {Position = UDim2.new(0.5, -WIN_W/2, 1.5, 0), BackgroundTransparency = 1}, 0.4)
     SmoothTween(Blur, {BackgroundTransparency = 1}, 0.3)
     task.delay(0.45, function() pcall(function() SG:Destroy() end) end)
-    pcall(function() local bg = game.CoreGui:FindFirstChild("BindIndicatorGui"); if bg then bg:Destroy() end end)
+    pcall(function() local bg2 = game.CoreGui:FindFirstChild("BindIndicatorGui"); if bg2 then bg2:Destroy() end end)
 end)
 
 -- TABS
@@ -1297,12 +1461,26 @@ end)
 SliderInput(MP, "Jump Power", 50, 400, State.JumpPower, function(v)
     State.JumpPower = v; local h = GetHum(); if h then h.JumpPower = v end
 end)
+
 SectionLabel(MP, "MODES")
 local setInfJump = Toggle(MP, "Infinite Jump", "Jump in air with Space (BodyVelocity)", function(s)
     State.InfiniteJump = s
     if s then ShowBindIndicator("Infinite Jump") else HideBindIndicator("Infinite Jump") end
 end)
 toggleCallbacks["Infinite Jump"] = function() if setInfJump then setInfJump(not State.InfiniteJump) end end
+
+SectionLabel(MP, "STEALTH")
+local setInvisible = Toggle(MP, "Invisible", "Hide from other players (ghost mode)", function(s)
+    State.Invisible = s
+    if s then
+        EnableInvisible()
+        ShowBindIndicator("Invisible")
+    else
+        DisableInvisible()
+        HideBindIndicator("Invisible")
+    end
+end)
+toggleCallbacks["Invisible"] = function() if setInvisible then setInvisible(not State.Invisible) end end
 
 SectionLabel(MP, "COLLISION")
 local setNoclip = Toggle(MP, "Noclip", "Pass through walls and objects", function(s)
@@ -1648,23 +1826,21 @@ local setASp = Toggle(MiscP, "Anti-Spinner", "Remove spinner traps", function(s)
 end)
 toggleCallbacks["Anti-Spinner"] = function() if setASp then setASp(not State.AntiSweeper) end end
 
--- CLOSE / MENU TOGGLE
+-- CLOSE
 CloseBtn.MouseButton1Click:Connect(function()
     SmoothTween(Main, {Position = UDim2.new(0.5, -WIN_W/2, 1.5, 0)}, 0.35)
     SmoothTween(Blur, {BackgroundTransparency = 1}, 0.25)
     task.delay(0.37, function() SG.Enabled = false; MenuOpen = false; Main.Position = UDim2.new(0.5, -WIN_W/2, 0.5, -WIN_H/2) end)
 end)
 
--- ═══════════════════════════════════════
--- INFINITE JUMP (BodyVelocity method from v4.2)
--- Press Space while in Freefall = boost upward
--- ═══════════════════════════════════════
+-- INFINITE JUMP
 table.insert(allConnections, UIS.InputBegan:Connect(function(input, gp)
     if gp or not Running then return end
     if input.KeyCode == Enum.KeyCode.Space and State.InfiniteJump then
         local hum = GetHum()
         local hrp = GetHRP()
         if not hum or not hrp then return end
+        if InvisibleActive then return end -- Don't interfere with invisible
         local state = hum:GetState()
         if state == Enum.HumanoidStateType.Freefall and not jumpDebounce then
             jumpDebounce = true
@@ -1674,9 +1850,7 @@ table.insert(allConnections, UIS.InputBegan:Connect(function(input, gp)
             bv.Parent = hrp
             task.delay(0.08, function()
                 pcall(function() bv:Destroy() end)
-                task.delay(0.3, function()
-                    jumpDebounce = false
-                end)
+                task.delay(0.3, function() jumpDebounce = false end)
             end)
         end
     end
@@ -1710,11 +1884,11 @@ end))
 table.insert(allConnections, RS.RenderStepped:Connect(function()
     if not Running then return end
     pcall(updateESP)
-    if State.Noclip then pcall(function()
+    if State.Noclip and not InvisibleActive then pcall(function()
         local c = LP.Character; if not c then return end
         for _, p in pairs(c:GetChildren()) do if p:IsA("BasePart") then p.CanCollide = false end end
     end) end
-    if State.Reach then pcall(function()
+    if State.Reach and not InvisibleActive then pcall(function()
         local c = LP.Character; if not c then return end
         local tool = c:FindFirstChildOfClass("Tool")
         if tool and isMeleeTool(tool) then
@@ -1737,6 +1911,16 @@ table.insert(allConnections, LP.CharacterAdded:Connect(function(char)
         if Running and Hum and Hum.Parent and Hum.JumpPower ~= State.JumpPower then Hum.JumpPower = State.JumpPower end
     end))
     lastSafePos = nil; jumpDebounce = false
+    
+    -- Clean up invisible on respawn
+    if InvisibleActive then
+        InvisibleActive = false
+        if InvisConn then pcall(function() InvisConn:Disconnect() end) InvisConn = nil end
+        if FakeCharModel then pcall(function() FakeCharModel:Destroy() end) FakeCharModel = nil end
+        pcall(function() workspace.FallenPartsDestroyHeight = getgenv().FPDH end)
+        pcall(function() workspace.CurrentCamera.CameraSubject = Hum end)
+    end
+    
     if State.AntiVoid then StartAntiVoid() end
     if State.AutoSword then StartAutoSword() end
     if State.DeathNoteTP then StartDeathNoteTP() end
@@ -1775,4 +1959,4 @@ Blur.BackgroundTransparency = 1
 BounceTween(Main, {Size = UDim2.new(0, WIN_W, 0, WIN_H), BackgroundTransparency = 0.02}, 0.5)
 SmoothTween(Blur, {BackgroundTransparency = 0.5}, 0.4)
 
-print("QWEN v5.0 Fluent | DELETE = menu | RightClick = bind | Backspace = unbind | Space in air = inf jump")
+print("QWEN v5.0 | DELETE=menu | Invisible = ghost mode (controller part)")

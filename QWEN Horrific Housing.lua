@@ -25,6 +25,7 @@ local HRP = Char:WaitForChild("HumanoidRootPart")
 local Running = true
 local MenuOpen = false
 
+
 local State = {
     Speed = 16,
     JumpPower = 50,
@@ -39,6 +40,47 @@ local State = {
     Noclip = false,
     Reach = false,
 }
+
+-- СОХРАНЕНИЕ НАСТРОЕК
+local SAVE_KEY = "HorrificUltimate_v42_Settings"
+
+local function SaveSettings()
+    local data = {
+        Speed = State.Speed,
+        JumpPower = State.JumpPower,
+        KillAura = State.KillAura,
+        ESP = State.ESP,
+        AntiLava = State.AntiLava,
+        AntiVoid = State.AntiVoid,
+        InfiniteJump = State.InfiniteJump,
+        AntiSweeper = State.AntiSweeper,
+        DeathNoteTP = State.DeathNoteTP,
+        AutoSword = State.AutoSword,
+        Noclip = State.Noclip,
+        Reach = State.Reach,
+    }
+    pcall(function()
+        writefile(SAVE_KEY .. ".json", game:GetService("HttpService"):JSONEncode(data))
+    end)
+end
+
+local function LoadSettings()
+    local ok, result = pcall(function()
+        if isfile(SAVE_KEY .. ".json") then
+            return game:GetService("HttpService"):JSONDecode(readfile(SAVE_KEY .. ".json"))
+        end
+    end)
+    if ok and result then
+        for k, v in pairs(result) do
+            if State[k] ~= nil then
+                State[k] = v
+            end
+        end
+    end
+end
+
+LoadSettings()
+
 
 local FlingActive = false
 local SelectedTargets = {}
@@ -1072,8 +1114,31 @@ local function Toggle(parent, name, desc, callback)
     Corner(circle, 9)
 
     local enabled = false
+    local stateKey = nil
+    for k, v in pairs(State) do
+        if type(v) == "boolean" then
+            local nameLower = name:lower():gsub("%s", ""):gsub("-", "")
+            local keyLower = k:lower()
+            if nameLower:find(keyLower) or keyLower:find(nameLower) then
+                stateKey = k
+                break
+            end
+        end
+    end
+    if stateKey and State[stateKey] == true then
+        enabled = true
+    end	
+	
 
     local btn = Instance.new("TextButton")
+    if enabled then
+        togBg.BackgroundColor3 = Color3.fromRGB(220, 220, 220)
+        circle.Position = UDim2.new(1, -21, 0.5, -9)
+        circle.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+        frame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+        nameL.TextColor3 = Color3.fromRGB(255, 255, 255)
+        descL.TextColor3 = Color3.fromRGB(70, 70, 70)
+    end
     btn.Size = UDim2.new(1, 0, 1, 0)
     btn.BackgroundTransparency = 1
     btn.Text = ""
@@ -1095,6 +1160,7 @@ local function Toggle(parent, name, desc, callback)
             Tween(descL,  {TextColor3 = Color3.fromRGB(45, 45, 45)}, 0.2)
         end
         callback(enabled)
+        SaveSettings()
     end)
 
     btn.MouseEnter:Connect(function()
@@ -1184,6 +1250,7 @@ local function SliderInput(parent, name, minV, maxV, def, callback)
         knob.Position = UDim2.new(pct, 0, 0.5, 0)
         inputBox.Text = tostring(v)
         callback(v)
+        SaveSettings()
     end
 
     inputBox.FocusLost:Connect(function()
@@ -1287,11 +1354,11 @@ end)
 -- ============================================================
 local MP = TabPages.Movement
 SectionLabel(MP, "ПАРАМЕТРЫ")
-SliderInput(MP, "Скорость", 16, 250, 16, function(v)
+SliderInput(MP, "Скорость", 16, 250, State.Speed, function(v)
     State.Speed = v
     if Hum then Hum.WalkSpeed = v end
 end)
-SliderInput(MP, "Высота прыжка", 50, 400, 50, function(v)
+SliderInput(MP, "Высота прыжка", 50, 400, State.JumpPower, function(v)
     State.JumpPower = v
     if Hum then Hum.JumpPower = v end
 end)
@@ -1954,6 +2021,14 @@ end)
 -- ============================================================
 task.wait(0.5)
 RefreshFlingList()
+-- Запуск функций если они были включены при загрузке
+if State.KillAura then task.spawn(KillAura) end
+if State.AntiLava then task.spawn(AntiLavaLoop) end
+if State.AntiVoid then StartAntiVoid() end
+if State.AntiSweeper then task.spawn(AntiSweeperLoop) end
+if State.DeathNoteTP then StartDeathNoteTP() end
+if State.AutoSword then StartAutoSword() end
+if State.InfiniteJump then end -- включается через UIS автоматически
 RefreshTpList()
 
 SG.Enabled = true

@@ -64,36 +64,12 @@ local Running = true
 local SAVE_FILE = "NadoHorrific.json"
 
 local State = {
-    -- Combat
-    AutoSwing   = false,
-    SwingCPS    = 12,
-    ClickHold   = 35,     -- ms the button stays down (0 = broken clicks)
-    CDBypass    = false,  -- OFF: 47 GC writes per swing froze the VM
-    RequireTool = false,   -- tool detection is unreliable in Matcha
-    AutoEquip   = false,  -- press "1" when hands are empty
-    KillAura    = true,   -- only swing when someone is actually in range
-    AuraRange   = 15,     -- studs, same as the nado.txt kill aura
-    MeleeOnly   = true,   -- do not spam clicks while holding a gun
-    NeedFocus   = false,  -- pause when the Roblox window is not focused
-    ShowHUD     = true,   -- on-screen status while the menu is closed
-
     -- Event handlers
-    AntiLava    = false,
-    AntiSweeper = false,
     AntiWater   = false,
     AntiBomb    = false,
-    AntiFire    = false,
-    AntiBees    = false,
     AntiVoid    = false,
     HoverHeight = 12,
     PushDist    = 28,
-
-    -- Loot
-    AutoLoot    = false,
-    LootWeapons = true,
-    LootNote    = true,
-    LootGear    = true,
-    LootRange   = 350,
 
     -- Appearance (INS-ui handles the rest in its own Theme tab)
     Theme       = "",     -- empty = keep whatever the library/config already has
@@ -114,11 +90,12 @@ local State = {
     BoxSortRole = true,   -- murderer / sheriff first
     BoxHideIdle = false,  -- hide players holding nothing
     BoxX        = 20,
-    BoxY        = 320,
+    BoxY        = 200,
 
     -- Misc
-    Noclip      = false,
-    ScanRate    = 10,     -- workspace scans per 10 seconds
+    ScanRate    = 4,      -- workspace scans per 10 seconds (was 10: too heavy)
+    LowSpec     = false,  -- halve every refresh rate on weak machines
+    ESPRate     = 15,     -- ESP redraws per second
 }
 
 local function SaveSettings()
@@ -127,9 +104,6 @@ local function SaveSettings()
 end
 
 local function LoadSettings()
--- Older configs could hold CPS values high enough to stall the VM.
-if State.SwingCPS > 20 then State.SwingCPS = 20 end
-if State.ScanRate > 10 then State.ScanRate = 10 end
     if type(isfile) ~= "function" or not isfile(SAVE_FILE) then return end
     local ok, data = pcall(function() return HttpService:JSONDecode(readfile(SAVE_FILE)) end)
     if ok and type(data) == "table" then
@@ -139,6 +113,9 @@ if State.ScanRate > 10 then State.ScanRate = 10 end
     end
 end
 LoadSettings()
+-- Clamp anything an older config might hold too high for the VM.
+if type(State.ScanRate) ~= "number" or State.ScanRate > 10 then State.ScanRate = 4 end
+if type(State.ESPRate)  ~= "number" or State.ESPRate  > 30 then State.ESPRate  = 15 end
 
 ------------------------------------------------------------------
 -- 2. HELPERS
@@ -186,37 +163,6 @@ local function SetPosition(part, v)
     return pcall(function() part.CFrame = CFrame.new(v.X, v.Y, v.Z) end)
 end
 
--- Matcha does not document a Tool class, so FindFirstChildOfClass("Tool")
--- can return nil even with a sword in hand. Try several ways.
-local function GetEquippedTool()
-    local char = GetChar()
-    if not char then return nil end
-
-    local ok, tool = pcall(function() return char:FindFirstChildOfClass("Tool") end)
-    if ok and tool then return tool end
-
-    ok, tool = pcall(function() return char:FindFirstChildWhichIsA("Tool") end)
-    if ok and tool then return tool end
-
-    -- last resort: walk the children and look for a Tool-shaped object
-    local kids
-    ok, kids = pcall(function() return char:GetChildren() end)
-    if ok and kids then
-        for _, o in pairs(kids) do
-            local cls
-            pcall(function() cls = o.ClassName end)
-            if cls == "Tool" then return o end
-            if cls ~= "Part" and cls ~= "MeshPart" and cls ~= "Humanoid" and
-               cls ~= "Accessory" and cls ~= "Shirt" and cls ~= "Pants" then
-                local handle
-                pcall(function() handle = o:FindFirstChild("Handle") end)
-                if handle then return o end
-            end
-        end
-    end
-    return nil
-end
-
 local function lower(s) return string.lower(tostring(s)) end
 
 local function matchAny(name, words)
@@ -260,7 +206,7 @@ end
 --]]
 
 local PlayerInfo = {}      -- array of { plr, name, root, pos, hp, tool, role }
-local infoBuiltAt = 0
+local infoBuiltAt = -math.huge
 
 local ROLE_MURDER  = { "murderer", "murder", "knife", "dagger", "machete", "cleaver" }
 local ROLE_SHERIFF = { "sheriff", "revolver", "peacemaker", "pistol", "gun" }
@@ -306,6 +252,26 @@ local function ToolsOfPlayer(plr, char)
         end
     end)
 
+    -- Roblox usually hides other players' Backpack from us, so if we found
+    -- nothing there, look for role-revealing accessories and welded parts on
+    -- the character itself. A drawn knife or gun is often a child part.
+    if not held and #bag == 0 and char then
+        pcall(function()
+            local kids = char:GetChildren()
+            if not kids then return end
+            for _, o in pairs(kids) do
+                local nm, cls
+                pcall(function() nm = o.Name cls = o.ClassName end)
+                if nm and cls ~= "Humanoid" and cls ~= "Shirt" and cls ~= "Pants" then
+                    if matchAny(nm, ROLE_MURDER) or matchAny(nm, ROLE_SHERIFF) then
+                        held = nm
+                        return
+                    end
+                end
+            end
+        end)
+    end
+
     return held, bag
 end
 
@@ -339,45 +305,95 @@ local function ClassifyTool(toolName)
     return "holding"
 end
 
+-- Per player persistent record. Name, DisplayName and the Character
+-- model barely ever change, so they are read ONCE and reused. Only the
+-- things that actually move (position, health) are re-read every pass.
+local infoByPlayer = {}
+local slowTick = 0
+
 local function RefreshPlayerInfo()
-    local out = {}
-    local players = {}
-    pcall(function() players = Players:GetPlayers() end)
+    local players
+    local ok = pcall(function() players = Players:GetPlayers() end)
+    if not ok or not players then return end
+
+    slowTick = slowTick + 1
+    local doSlow = (slowTick % 5 == 0)   -- tools/backpack ~1x per second
+
+    local out, alive = {}, {}
 
     for _, plr in pairs(players) do
         if plr ~= LP then
-            local e = { plr = plr, name = "?", hp = 0 }
-            pcall(function() e.name = plr.Name end)
-            pcall(function() if plr.DisplayName then e.display = plr.DisplayName end end)
+            alive[plr] = true
+            local e = infoByPlayer[plr]
+
+            if not e then
+                -- first sighting: read the static fields a single time
+                e = { plr = plr, name = "?", hp = 0, maxhp = 100 }
+                pcall(function() e.name = plr.Name end)
+                pcall(function()
+                    if plr.DisplayName then e.display = plr.DisplayName end
+                end)
+                infoByPlayer[plr] = e
+                e.charStamp = nil
+            end
 
             local char
             pcall(function() char = plr.Character end)
-            if char then
-                pcall(function() e.root = char:FindFirstChild("HumanoidRootPart") end)
-                pcall(function() e.head = char:FindFirstChild("Head") end)
-                pcall(function()
-                    local hum = char:FindFirstChildOfClass("Humanoid")
-                    if hum then e.hp = hum.Health end
-                end)
-                if e.root then pcall(function() e.pos = e.root.Position end) end
+
+            if char ~= e.char then
+                -- respawned: the part references we cached are now dead
+                e.char = char
+                e.root, e.head = nil, nil
+                e.tool, e.bag, e.role = nil, nil, "none"
+                if char then
+                    pcall(function() e.root = char:FindFirstChild("HumanoidRootPart") end)
+                    pcall(function() e.head = char:FindFirstChild("Head") end)
+                    pcall(function() e.hum = char:FindFirstChildOfClass("Humanoid") end)
+                else
+                    e.hum = nil
+                end
+            end
+
+            if e.root then
+                -- the only field that truly must be fresh every pass
+                pcall(function() e.pos = e.root.Position end)
+            else
+                e.pos = nil
+            end
+
+            if e.hum then
+                pcall(function() e.hp = e.hum.Health end)
+            else
+                e.hp = 0
+            end
+
+            -- tools change rarely; scanning them 5x a second was the
+            -- single most expensive thing this script did
+            -- a brand new player (or a fresh respawn) is scanned at once,
+            -- otherwise a murderer could stay unlabelled for a second
+            if char and (doSlow or e.tool == nil) then
                 local held, bag = ToolsOfPlayer(plr, char)
                 e.tool = held
                 e.bag  = bag
                 e.role = ClassifyTool(held)
-                -- if the murder weapon is only in the backpack, still flag it
                 if e.role == "none" or e.role == "holding" then
-                    for _, itemName in ipairs(bag) do
+                    for _, itemName in ipairs(bag or {}) do
                         local c = ClassifyTool(itemName)
                         if c == "murderer" or c == "sheriff" then e.role = c break end
                     end
                 end
             end
+
             out[#out + 1] = e
         end
     end
 
+    -- drop records for players who left
+    for plr in pairs(infoByPlayer) do
+        if not alive[plr] then infoByPlayer[plr] = nil end
+    end
+
     PlayerInfo = out
-    infoBuiltAt = tick()
 end
 
 ------------------------------------------------------------------
@@ -385,40 +401,22 @@ end
 ------------------------------------------------------------------
 
 local DANGER = {
-    Lava    = { flag = "AntiLava",    mode = "hover",
-                words = { "lava", "magma" } },
-    Sweeper = { flag = "AntiSweeper", mode = "hover",
-                words = { "sweeper", "spinner", "spin", "laser", "beam",
-                          "killbrick", "killpart", "rotor", "blade" } },
     Water   = { flag = "AntiWater",   mode = "hover",
                 words = { "water", "flood", "tsunami", "wave", "ocean" } },
     Bomb    = { flag = "AntiBomb",    mode = "push",
                 words = { "bomb", "nuke", "missile", "rocket", "explos",
                           "tnt", "dynamite", "mine" } },
-    Fire    = { flag = "AntiFire",    mode = "push",
-                words = { "campfire", "fire", "flame", "burning" } },
-    Bees    = { flag = "AntiBees",    mode = "push",
-                words = { "bee", "hive", "beehive" } },
 }
 
-local LOOT = {
-    Note    = { flag = "LootNote",
-                words = { "deathnote", "death note", "note" } },
-    Weapons = { flag = "LootWeapons",
-                words = { "sword", "blade", "knife", "katana", "illumina",
-                          "darkheart", "linkedsword", "saber", "lightsaber",
-                          "scythe", "dagger", "axe", "hammer", "bonk",
-                          "gauntlet", "pistol", "sniper", "launcher",
-                          "staff", "gun", "paintball", "flute", "peacemaker" } },
-    Gear    = { flag = "LootGear",
-                words = { "coil", "gravity", "speed", "regen", "totem",
-                          "banana", "candy", "cola", "potion", "brew",
-                          "present", "gift", "chest", "treasure", "loot",
-                          "anvil", "extinguisher", "trowel", "jetpack",
-                          "fishingrod", "fishing rod", "pizza", "burger" } },
+-- Names that merely CONTAIN a danger word but are harmless. Without this
+-- "Fireplace" decor or a "FireExtinguisher" gear would shove you around
+-- forever, which is what made Anti-Fire feel broken.
+local DANGER_IGNORE = {
+    "extinguisher", "fireplace", "firework", "fireflies", "campfirelog",
+    "firetruck", "waterfall", "watermelon", "lavalamp", "beehiveornament",
 }
 
-local dangerCache, lootCache = {}, {}
+local dangerCache = {}
 local lastScanAt, scanCount, scanCost = 0, 0, 0
 
 local function AnyDangerOn()
@@ -428,58 +426,72 @@ local function AnyDangerOn()
     return false
 end
 
+-- Scanning the whole map in one go took ~8ms on a busy server, which is
+-- longer than a frame. Whatever you clicked during that window was simply
+-- never processed, which felt like "the menu ignores me".
+-- The work is now split into chunks with a yield between them, so input
+-- always gets a turn.
+-- Resumable scan.
+--
+-- The previous version called wait() inside the loop, but the worker calls
+-- this through pcall, and Lua cannot yield across a pcall boundary. The
+-- scan therefore died on its very first chunk with a silent error, which
+-- is why hazard features stopped reacting.
+--
+-- Now the work is spread across calls instead: each call processes a slice
+-- and remembers where it stopped. No yielding, same smooth behaviour.
+local scanList, scanPos, scanAcc = nil, 1, {}
+local SCAN_CHUNK = 400
+
 local function ScanWorkspace()
     local t0 = tick()
-    local ok, list = pcall(function() return Workspace:GetDescendants() end)
-    if not ok or not list then return end
 
-    local dNew, lNew = {}, {}
-    local wantDanger = AnyDangerOn()
-    local wantLoot   = State.AutoLoot
+    if not AnyDangerOn() then
+        dangerCache, scanList, scanPos, scanAcc = {}, nil, 1, {}
+        return
+    end
 
-    for _, o in pairs(list) do
+    -- start a fresh pass
+    if not scanList then
+        local ok, list = pcall(function() return Workspace:GetDescendants() end)
+        if not ok or not list then return end
+        scanList, scanPos, scanAcc = list, 1, {}
+    end
+
+    local total = #scanList
+    local stop = scanPos + SCAN_CHUNK - 1
+    if stop > total then stop = total end
+
+    for idx = scanPos, stop do
+        local o = scanList[idx]
         local nm
         pcall(function() nm = o.Name end)
         if nm then
-            if wantDanger then
-                local isPart = false
-                pcall(function() isPart = o:IsA("BasePart") end)
-                if isPart then
-                    for tag, def in pairs(DANGER) do
-                        if State[def.flag] and matchAny(nm, def.words) then
-                            dNew[#dNew + 1] = { inst = o, tag = tag, mode = def.mode }
-                            break
-                        end
-                    end
-                end
-            end
-            if wantLoot then
-                local cls
-                pcall(function() cls = o.ClassName end)
-                if cls == "Tool" or cls == "HopperBin" or cls == "Model" or cls == "Part" or cls == "MeshPart" then
-                    for tag, def in pairs(LOOT) do
-                        if State[def.flag] and matchAny(nm, def.words) then
-                            -- ignore things already in someone's hands
-                            local mine = false
-                            pcall(function()
-                                local ch = GetChar()
-                                if ch and o:IsDescendantOf(ch) then mine = true end
-                            end)
-                            if not mine then
-                                lNew[#lNew + 1] = { inst = o, tag = tag, name = nm }
-                            end
-                            break
-                        end
+            local isPart = false
+            pcall(function() isPart = o:IsA("BasePart") end)
+            if isPart and not matchAny(nm, DANGER_IGNORE) then
+                for tag, def in pairs(DANGER) do
+                    if State[def.flag] and matchAny(nm, def.words) then
+                        scanAcc[#scanAcc + 1] = { inst = o, tag = tag, mode = def.mode }
+                        break
                     end
                 end
             end
         end
     end
 
-    dangerCache, lootCache = dNew, lNew
-    scanCount = scanCount + 1
-    scanCost  = math.floor((tick() - t0) * 1000)
+    scanPos = stop + 1
+
+    -- finished the whole map: publish the result and reset
+    if scanPos > total then
+        dangerCache = scanAcc
+        scanList, scanPos, scanAcc = nil, 1, {}
+        scanCount = scanCount + 1
+        scanCost  = math.floor((tick() - t0) * 1000)
+    end
 end
+
+
 
 ------------------------------------------------------------------
 -- 4. EVENT REACTIONS
@@ -490,9 +502,16 @@ local hoverActive  = false
 local eventStatus  = "idle"
 local reactions    = 0
 
-local lastDangerAt = 0
+local lastDangerAt = -math.huge
 
 local function DangerStep()
+    -- Cheapest possible exit: if nothing is enabled we must not touch
+    -- tick(), the character, or anything else. This runs every frame.
+    if not (State.AntiVoid or #dangerCache > 0) then
+        if hoverActive then hoverActive = false end
+        return
+    end
+
     local nowD = tick()
     if nowD - lastDangerAt < 0.05 then return end
     lastDangerAt = nowD
@@ -504,13 +523,12 @@ local function DangerStep()
     pcall(function() myPos = hrp.Position end)
     if not myPos then return end
 
-    -- remember the last spot that was not over a hazard
     if myPos.Y > -5 then lastSafePos = myPos end
 
     -- Anti-Void first: it does not need the scanner
     if State.AntiVoid and myPos.Y < -30 and lastSafePos then
         SetPosition(hrp, Vector3.new(lastSafePos.X, lastSafePos.Y + 18, lastSafePos.Z))
-        pcall(function() hrp.Velocity = Vector3.zero end)
+        pcall(function() hrp.Velocity = Vector3.new(0, 0, 0) end)
         eventStatus = "anti-void: pulled you back"
         reactions = reactions + 1
         return
@@ -522,7 +540,7 @@ local function DangerStep()
     end
 
     local bestHover, bestHoverY, bestHoverTag = nil, nil, nil
-    local pushX, pushZ, pushTag = 0, 0, nil
+    local pushX, pushZ, pushTag, pushClose = 0, 0, nil, nil
 
     for _, d in ipairs(dangerCache) do
         local inst = d.inst
@@ -531,13 +549,34 @@ local function DangerStep()
         if p and sz then
             local dx, dz = myPos.X - p.X, myPos.Z - p.Z
             local flat = math.sqrt(dx * dx + dz * dz)
-            -- horizontal reach of the part plus a margin
-            local reach = math.max(sz.X, sz.Z) * 0.5 + 6
+            -- A spinner blade is long and thin. Using its LONG side as the
+            -- danger radius made it trigger from 30+ studs away, which felt
+            -- like it was doing nothing useful. Use the short side instead,
+            -- because that is the part that actually sweeps through you.
+            local longSide  = math.max(sz.X, sz.Z)
+            local shortSide = math.min(sz.X, sz.Z)
+            local reach
+            if longSide > shortSide * 4 then
+                reach = longSide * 0.5 + 4      -- thin blade: keep full length
+            else
+                reach = longSide * 0.5 + 6      -- ordinary plate
+            end
 
             if d.mode == "hover" then
                 local topY = p.Y + sz.Y * 0.5
-                -- react only if we are inside its footprint and not already above it
-                if flat < reach and myPos.Y < topY + State.HoverHeight then
+
+                -- HYSTERESIS.
+                -- The old check re-triggered only below (top + HoverHeight),
+                -- so the moment we teleported to exactly that height the test
+                -- failed, gravity pulled us down, and it fired again next
+                -- frame: a permanent bounce that never actually protected you.
+                -- Now we hold anywhere inside a band around the target height.
+                local target = topY + State.HoverHeight
+                local band   = math.max(4, State.HoverHeight * 0.5)
+                -- A spinner sits at player height, so "am I below its top"
+                -- is not enough: we must also react when we are level with it.
+                local levelWith = math.abs(myPos.Y - p.Y) < (sz.Y * 0.5 + 6)
+                if flat < reach and (myPos.Y < target + band or levelWith) then
                     if not bestHoverY or topY > bestHoverY then
                         bestHoverY   = topY
                         bestHover    = inst
@@ -545,19 +584,30 @@ local function DangerStep()
                     end
                 end
             else
-                local radius = math.max(sz.X, sz.Z) * 0.5 + State.PushDist
+                -- PUSH.
+                -- Radius used to be (part size + PushDist), so a 4 stud
+                -- campfire owned a 30 stud circle and you could never stand
+                -- anywhere. Now PushDist IS the distance we keep from its edge.
+                local edge   = math.max(sz.X, sz.Z) * 0.5
+                local radius = edge + State.PushDist
                 if flat < radius and flat > 0.1 then
                     local w = (radius - flat) / radius
                     pushX = pushX + (dx / flat) * w
                     pushZ = pushZ + (dz / flat) * w
                     pushTag = d.tag
+                    if not pushClose or flat < pushClose then pushClose = flat end
                 end
             end
         end
     end
 
     if bestHover then
-        SetPosition(hrp, Vector3.new(myPos.X, bestHoverY + State.HoverHeight, myPos.Z))
+        local want = bestHoverY + State.HoverHeight
+        -- only move when we are actually off target, so we stop jittering
+        if math.abs(myPos.Y - want) > 1.5 then
+            SetPosition(hrp, Vector3.new(myPos.X, want, myPos.Z))
+        end
+        -- cancel the fall instead of fighting it every frame
         pcall(function() hrp.Velocity = Vector3.new(0, 0, 0) end)
         if not hoverActive then reactions = reactions + 1 end
         hoverActive = true
@@ -570,7 +620,14 @@ local function DangerStep()
     if pushTag then
         local len = math.sqrt(pushX * pushX + pushZ * pushZ)
         if len > 0.01 then
-            local step = 4
+            -- Step size now scales with how close the danger is: a gentle
+            -- nudge far away, a hard shove when you are inside it. The old
+            -- fixed 4 stud jump looked like teleport stutter.
+            local step = 2
+            if pushClose then
+                if pushClose < 6 then step = 6
+                elseif pushClose < 14 then step = 4 end
+            end
             SetPosition(hrp, Vector3.new(
                 myPos.X + (pushX / len) * step,
                 myPos.Y,
@@ -585,385 +642,11 @@ local function DangerStep()
 end
 
 ------------------------------------------------------------------
--- 5. AUTO LOOT
-------------------------------------------------------------------
-
-local lootStatus, lootGrabs, lastLootAt = "off", 0, 0
-
-local function LootStep()
-    if not State.AutoLoot then lootStatus = "off" return end
-    if not IsAlive() then lootStatus = "dead" return end
-
-    local now = tick()
-    if now - lastLootAt < 0.8 then return end
-
-    local hrp = GetHRP()
-    if not hrp then return end
-    local myPos
-    pcall(function() myPos = hrp.Position end)
-    if not myPos then return end
-
-    local best, bestD, bestName = nil, State.LootRange, "?"
-    for _, l in ipairs(lootCache) do
-        local p = PosOf(l.inst)
-        if p then
-            local d = (p - myPos).Magnitude
-            if d < bestD then best, bestD, bestName = p, d, l.name end
-        end
-    end
-
-    if best then
-        lastSafePos = myPos
-        SetPosition(hrp, Vector3.new(best.X, best.Y + 3.5, best.Z))
-        lastLootAt = now
-        lootGrabs  = lootGrabs + 1
-        lootStatus = "grabbed " .. bestName
-    else
-        lootStatus = "nothing in range"
-    end
-end
-
-------------------------------------------------------------------
 -- 6. AUTO SWING  (real input -- the only option in Matcha)
 ------------------------------------------------------------------
 
-local swingCount, lastToolName = 0, "none"
-local swingStatus = "idle"
 local gcCache, gcRefreshAt, gcHits = nil, 0, 0
 local menuIsOpen = function() return false end
-
--- Weapon classification, ported from the nado.txt kill aura
-local RANGED_KW = {
-    "gun", "pistol", "sniper", "launcher", "rocket", "revolver", "peacemaker",
-    "paintball", "ray", "famas", "cannon", "staff", "flute", "bow", "blaster",
-    "freeze", "extinguisher", "rod",
-}
-local MELEE_KW = {
-    "sword", "blade", "knife", "katana", "dagger", "axe", "scythe", "hammer",
-    "bonk", "saber", "lightsaber", "illumina", "darkheart", "linkedsword",
-    "machete", "cleaver", "gauntlet", "bat", "candycane", "candy cane",
-}
-
-local function IsMeleeTool(tool)
-    if not tool then return false end
-    local n
-    pcall(function() n = string.lower(tool.Name) end)
-    if not n then return false end
-    for _, k in ipairs(RANGED_KW) do
-        if string.find(n, k, 1, true) then return false end
-    end
-    for _, k in ipairs(MELEE_KW) do
-        if string.find(n, k, 1, true) then return true end
-    end
-    -- unknown tool: treat as melee only if it has a Handle
-    local h
-    pcall(function() h = tool:FindFirstChild("Handle") end)
-    return h ~= nil
-end
-
--- nado.txt logic: is a living player within reach right now?
-local auraTarget = nil
-
-local function TargetInRange()
-    local hrp = GetHRP()
-    if not hrp then return false end
-    local myPos
-    pcall(function() myPos = hrp.Position end)
-    if not myPos then return false end
-
-    local rng = State.AuraRange
-    for _, e in ipairs(PlayerInfo) do
-        if e.pos and e.hp and e.hp > 0 then
-            if (myPos - e.pos).Magnitude <= rng then
-                auraTarget = e.name
-                return true
-            end
-        end
-    end
-    auraTarget = nil
-    return false
-end
-
-local CD_KEYS = {
-    "Cooldown", "cooldown", "CoolDown", "COOLDOWN",
-    "Debounce", "debounce", "DeBounce", "canAttack", "CanAttack",
-    "canSwing", "CanSwing", "canHit", "CanHit", "canUse", "CanUse",
-    "attacking", "Attacking", "swinging", "Swinging", "isSwinging",
-    "AttackCooldown", "attackCooldown", "SwingCooldown", "swingCooldown",
-    "LastAttack", "lastAttack", "LastSwing", "lastSwing", "lastUse",
-    "NextAttack", "nextAttack", "nextSwing", "NextSwing",
-    "AttackSpeed", "attackSpeed", "SwingSpeed", "swingSpeed",
-    "ToolCooldown", "toolCooldown", "hitDebounce", "Reloading", "reloading",
-    "Delay", "delay", "Enabled", "enabled", "Equipped", "equipped",
-}
-
-local CD_VALUES = {
-    Cooldown = 0, cooldown = 0, CoolDown = 0, COOLDOWN = 0,
-    Debounce = false, debounce = false, DeBounce = false,
-    canAttack = true, CanAttack = true, canSwing = true, CanSwing = true,
-    canHit = true, CanHit = true, canUse = true, CanUse = true,
-    attacking = false, Attacking = false,
-    swinging = false, Swinging = false, isSwinging = false,
-    AttackCooldown = 0, attackCooldown = 0,
-    SwingCooldown = 0, swingCooldown = 0,
-    LastAttack = 0, lastAttack = 0, LastSwing = 0, lastSwing = 0, lastUse = 0,
-    NextAttack = 0, nextAttack = 0, nextSwing = 0, NextSwing = 0,
-    AttackSpeed = 0, attackSpeed = 0, SwingSpeed = 0, swingSpeed = 0,
-    ToolCooldown = 0, toolCooldown = 0, hitDebounce = false,
-    Reloading = false, reloading = false, Delay = 0, delay = 0,
-    Enabled = true, enabled = true,
-}
-
--- This used to run on EVERY swing: 47 GC writes x 12 swings a second.
--- That was the biggest remaining stall. Now it is rate limited, and the
--- write is skipped entirely once we learn the game patches values back.
-local lastBypassAt, bypassMisses = 0, 0
-
-local function ApplyCooldownBypass()
-    if not State.CDBypass then return end
-    if type(getgc) ~= "function" or type(applygc) ~= "function" then return end
-
-    local now = tick()
-    if now - lastBypassAt < 1.0 then return end   -- at most once per second
-    lastBypassAt = now
-
-    if not gcCache or now - gcRefreshAt > 15 then
-        local ok, c = pcall(function() return getgc(CD_KEYS) end)
-        if ok and c then gcCache = c gcRefreshAt = now end
-    end
-    if not gcCache then return end
-
-    pcall(function()
-        local n = applygc(gcCache, CD_VALUES)
-        if type(n) == "number" then
-            gcHits = n
-            -- nothing to patch means the cooldown is not in client Lua
-            if n == 0 then bypassMisses = bypassMisses + 1 else bypassMisses = 0 end
-        end
-    end)
-
-    -- give up after 10 useless seconds instead of burning CPU forever
-    if bypassMisses >= 10 then
-        State.CDBypass = false
-        bypassMisses = 0
-        gcCache = nil
-        pcall(function()
-            if Lib then
-                Lib:Notify("Cooldown Bypass",
-                    "No client cooldown found - disabled to stop the lag", 7, "warning")
-            end
-        end)
-    end
-end
-
--- Non-blocking click.
--- The old version did wait() BETWEEN press and release, so the thread was
--- parked mid-hold. At high CPS that is a yield every few ms and Matcha's VM
--- stalls. Now press and release happen on separate passes of one calm loop:
--- the button is never held across a yield we do not control.
-local pressedAt, isDown = 0, false
-
-local function PressDown()
-    if isDown then return end
-    if pcall(function() mouse1press() end) then
-        isDown = true
-        pressedAt = tick()
-    else
-        pcall(function() mouse1click() end)
-        swingCount = swingCount + 1
-    end
-end
-
-local function ReleaseUp()
-    if not isDown then return end
-    pcall(function() mouse1release() end)
-    isDown = false
-    swingCount = swingCount + 1
-end
-
-local function ForceRelease()
-    if isDown then
-        pcall(function() mouse1release() end)
-        isDown = false
-    end
-end
-
-local function AutoSwingLoop()
-    task.spawn(function()
-        -- One fixed, calm tick. Never scales with CPS, so the VM keeps up.
-        local TICK = 0.03
-        local nextSwingAt = 0
-
-        while Running do
-            if not State.AutoSwing then
-                ForceRelease()
-                swingStatus = "idle"
-                gcCache, gcHits = nil, 0
-                auraTarget = nil
-                wait(0.15)
-            else
-                local now = tick()
-
-                -- finish an open click first, whatever else happens
-                if isDown and (now - pressedAt) >= (State.ClickHold / 1000) then
-                    ReleaseUp()
-                end
-
-                local focused = true
-                pcall(function() focused = isrbxactive() end)
-
-                local tool = GetEquippedTool()
-                if tool then
-                    pcall(function() lastToolName = tool.Name end)
-                else
-                    lastToolName = "none"
-                end
-
-                local blocked = nil
-                if State.NeedFocus and not focused then
-                    blocked = "paused: game window not focused"
-                elseif menuIsOpen() then
-                    blocked = "paused: close the menu (F7)"
-                elseif healthReadable and GetHealth() == 0 then
-                    blocked = "paused: you are dead"
-                elseif State.RequireTool and not tool then
-                    blocked = "paused: no tool equipped"
-                elseif State.MeleeOnly and tool and not IsMeleeTool(tool) then
-                    blocked = "paused: ranged weapon"
-                end
-
-                if blocked then
-                    ForceRelease()
-                    swingStatus = blocked
-                    if blocked == "paused: no tool equipped" and State.AutoEquip and focused
-                       and not menuIsOpen() then
-                        pcall(function() keypress(0x31) keyrelease(0x31) end)
-                        swingStatus = "equipping (pressing 1)"
-                    end
-                    wait(0.25)
-                else
-                    -- nado.txt kill aura: only swing when a target is in reach
-                    local hasTarget = true
-                    if State.KillAura then hasTarget = TargetInRange() end
-
-                    if not hasTarget then
-                        ForceRelease()
-                        swingStatus = "waiting for a target"
-                        wait(0.15)          -- exactly the nado.txt pacing
-                    else
-                        swingStatus = auraTarget and ("hitting " .. auraTarget) or "swinging"
-                        if not isDown and now >= nextSwingAt then
-                            ApplyCooldownBypass()
-                            PressDown()
-                            local cps = State.SwingCPS
-                            if cps < 1 then cps = 1 end
-                            nextSwingAt = now + (1 / cps)
-                        end
-                        wait(TICK)
-                    end
-                end
-            end
-        end
-        ForceRelease()
-    end)
-end
-
-------------------------------------------------------------------
--- 7. NOCLIP
-------------------------------------------------------------------
-
--- Throttled: GetDescendants() every frame was a major stall source.
-local lastNoclipAt = 0
-
-local function NoclipStep()
-    if not State.Noclip then return end
-    local now = tick()
-    if now - lastNoclipAt < 0.4 then return end
-    lastNoclipAt = now
-
-    local char = GetChar()
-    if not char then return end
-    -- direct children only: body parts live there, and it is far cheaper
-    local ok, parts = pcall(function() return char:GetChildren() end)
-    if not ok or not parts then return end
-    for _, p in pairs(parts) do
-        pcall(function()
-            if p:IsA("BasePart") and p.CanCollide then p.CanCollide = false end
-        end)
-    end
-end
-
-
-------------------------------------------------------------------
--- 7b. ON-SCREEN HUD (the menu hides the status, so draw it outside)
-------------------------------------------------------------------
-
-local hudBg, hudTxt, hudDot
-local hudReady = false
-
-local function BuildHUD()
-    if hudReady then return end
-    local FONT
-    pcall(function()
-        FONT = Drawing.Fonts and (Drawing.Fonts.Monospace or Drawing.Fonts.System)
-    end)
-    local function mk(kind, props)
-        local ok, o = pcall(function() return Drawing.new(kind) end)
-        if not ok or not o then return nil end
-        for k, v in pairs(props) do pcall(function() o[k] = v end) end
-        return o
-    end
-    hudBg  = mk("Square", { Filled = true, Visible = false, ZIndex = 1,
-                            Color = Color3.fromRGB(12, 13, 15), Transparency = 0.55,
-                            Corner = 6, Rounding = 6 })
-    hudDot = mk("Circle", { Radius = 4, NumSides = 14, Filled = true, Visible = false,
-                            ZIndex = 3, Color = Color3.fromRGB(126, 217, 163) })
-    hudTxt = mk("Text",   { Visible = false, ZIndex = 3, Center = false, Outline = true,
-                            Color = Color3.fromRGB(236, 238, 242) })
-    if hudTxt then
-        if FONT then pcall(function() hudTxt.Font = FONT end) end
-        pcall(function() hudTxt.FontSize = 13 end)
-        pcall(function() hudTxt.Size = 13 end)
-        pcall(function() hudTxt.Transparency = 1 end)
-    end
-    hudReady = true
-end
-
-local function HUDStep()
-    if not hudReady then return end
-    local show = State.ShowHUD and State.AutoSwing and not menuIsOpen()
-    if not show then
-        pcall(function() hudBg.Visible = false end)
-        pcall(function() hudTxt.Visible = false end)
-        pcall(function() hudDot.Visible = false end)
-        return
-    end
-
-    local txt = "SWING  " .. swingStatus .. "   [" .. swingCount .. "]"
-    local w = 26 + #txt * 7
-    local x, y = 18, 120
-
-    local good = (swingStatus == "swinging")
-    local col = good and Color3.fromRGB(126, 217, 163) or Color3.fromRGB(250, 190, 60)
-
-    pcall(function()
-        hudBg.Position = Vector2.new(x, y)
-        hudBg.Size     = Vector2.new(w, 26)
-        hudBg.Visible  = true
-    end)
-    pcall(function()
-        hudDot.Position = Vector2.new(x + 13, y + 13)
-        hudDot.Color    = col
-        hudDot.Visible  = true
-    end)
-    pcall(function()
-        hudTxt.Text     = txt
-        hudTxt.Position = Vector2.new(x + 24, y + 6)
-        hudTxt.Color    = col
-        hudTxt.Visible  = true
-    end)
-end
-
 
 ------------------------------------------------------------------
 -- 7c. ROLE ESP  (murderer / sheriff detection)
@@ -1020,14 +703,67 @@ local function espSlot(plr)
     return set
 end
 
-local function espHide(set)
-    if not set then return end
-    for _, o in pairs(set) do pcall(function() o.Visible = false end) end
+-- Direct property write with its own pcall. Cheaper than wrapping a whole
+-- block in pcall(function() ... end), which allocates a closure every call
+-- and was running hundreds of times per second inside the ESP loop.
+-- Remember the last value written to every Drawing property. Re-writing an
+-- identical value still costs a full cross-process write, and most frames
+-- change almost nothing, so this skips the majority of them.
+local propCache = setmetatable({}, { __mode = "k" })
+
+local function SameDrawingValue(a, b)
+    if a == b then return true end
+
+    -- Matcha exposes Roblox datatypes as userdata, not tables. Compare their
+    -- public fields so fresh Vector2/Color3 objects with the same value do not
+    -- cause another expensive Drawing write every ESP tick.
+    local ax, ay, az, bx, by, bz
+    if pcall(function()
+        ax, ay = a.X, a.Y
+        bx, by = b.X, b.Y
+    end) and ax ~= nil and bx ~= nil then
+        pcall(function() az, bz = a.Z, b.Z end)
+        if az ~= nil or bz ~= nil then return ax == bx and ay == by and az == bz end
+        return ax == bx and ay == by
+    end
+
+    local ar, ag, ab, br, bg, bb
+    if pcall(function()
+        ar, ag, ab = a.R, a.G, a.B
+        br, bg, bb = b.R, b.G, b.B
+    end) and ar ~= nil and br ~= nil then
+        return ar == br and ag == bg and ab == bb
+    end
+
+    return false
 end
 
-local lastESPAt = 0
+local function SetProp(o, prop, val)
+    if not o then return end
+    local c = propCache[o]
+    if not c then c = {} propCache[o] = c end
+    local prev = c[prop]
+    if prev ~= nil and SameDrawingValue(prev, val) then return end
+    c[prop] = val
+    pcall(function() o[prop] = val end)
+end
 
-local lastESPAt = 0
+-- Writing Visible on an already-hidden object still costs a cross-process
+-- write, so remember the last state and only write on a real change.
+local espVis = {}
+
+local function espHide(set)
+    if not set then return end
+    if espVis[set] == false then return end
+    espVis[set] = false
+
+    -- Use SetProp, not a raw `o.Visible = false`. Raw writes left the property
+    -- cache thinking the object was still visible; the next SetProp(..., true)
+    -- could then be skipped and ESP stayed invisible forever after one hide.
+    for _, o in pairs(set) do SetProp(o, "Visible", false) end
+end
+
+local lastESPAt = -math.huge
 
 local function RoleStyle(role, toolName)
     if role == "murderer" then return Color3.fromRGB(255, 70, 70),  "MURDERER" end
@@ -1037,18 +773,27 @@ local function RoleStyle(role, toolName)
     return Color3.fromRGB(150, 155, 165), ""
 end
 
+local espWasOn = false
+
 local function ESPStep()
     if not espReady then return end
 
     if not State.RoleESP then
-        pcall(function() if loadoutBox then loadoutBox:Remove() end end)
-    for _, set in pairs(espObjs) do espHide(set) end
-        roleCounts.murderer, roleCounts.sheriff, roleCounts.armed = 0, 0, 0
+        -- Hide once on the switch-off frame, then do nothing at all.
+        if espWasOn then
+            espWasOn = false
+            for _, set in pairs(espObjs) do espHide(set) end
+            roleCounts.murderer, roleCounts.sheriff, roleCounts.armed = 0, 0, 0
+        end
         return
     end
+    espWasOn = true
 
     local nowT = tick()
-    if nowT - lastESPAt < 0.06 then return end   -- ~16 Hz ceiling
+    local espRate = State.ESPRate or 15
+    if espRate < 1 then espRate = 1 end
+    if State.LowSpec then espRate = espRate / 2 end
+    if nowT - lastESPAt < (1 / espRate) then return end
     lastESPAt = nowT
 
     local myPos
@@ -1077,12 +822,25 @@ local function ESPStep()
         if not e.pos or not e.head or e.hp <= 0 then
             espHide(set)
         else
-            local dist = 0
-            if myPos then dist = (e.pos - myPos).Magnitude end
-
-            local skip = dist > State.ESPRange
+            -- Cheap reject first: role filter costs nothing, and squared
+            -- distance avoids a sqrt per player per frame.
+            local skip = false
             if State.ESPOnlyRole and e.role ~= "murderer" and e.role ~= "sheriff" then
                 skip = true
+            end
+
+            local dist = 0
+            if not skip and myPos then
+                local dx = e.pos.X - myPos.X
+                local dy = e.pos.Y - myPos.Y
+                local dz = e.pos.Z - myPos.Z
+                local d2 = dx * dx + dy * dy + dz * dz
+                local rng = State.ESPRange
+                if d2 > rng * rng then
+                    skip = true            -- out of range: never project it
+                else
+                    dist = math.sqrt(d2)
+                end
             end
 
             if skip then
@@ -1099,6 +857,7 @@ local function ESPStep()
                     if not onTop and not onBot then
                         espHide(set)
                     else
+                        espVis[set] = true
                         local col, label = RoleStyle(e.role, e.tool)
                         local h = math.abs(bot.Y - top.Y)
                         if h < 8 then h = 8 end
@@ -1106,31 +865,26 @@ local function ESPStep()
                         local x = top.X - w / 2
 
                         if State.ESPBox then
-                            pcall(function()
-                                set.box.Position = Vector2.new(x, top.Y)
-                                set.box.Size     = Vector2.new(w, h)
-                                set.box.Color    = col
-                                set.box.Visible  = true
-                            end)
-                        else pcall(function() set.box.Visible = false end) end
+                            SetProp(set.box, "Position", Vector2.new(x, top.Y))
+                            SetProp(set.box, "Size", Vector2.new(w, h))
+                            SetProp(set.box, "Color", col)
+                            SetProp(set.box, "Visible", true)
+                        else SetProp(set.box, "Visible", false) end
 
                         if State.ESPName then
-                            pcall(function()
-                                set.name.Text     = (e.display or e.name) .. "  " .. math.floor(dist) .. "m"
-                                set.name.Position = Vector2.new(top.X, top.Y - 16)
-                                set.name.Color    = col
-                                set.name.Visible  = true
-                            end)
-                        else pcall(function() set.name.Visible = false end) end
+                            SetProp(set.name, "Text",
+                                (e.display or e.name) .. "  " .. math.floor(dist) .. "m")
+                            SetProp(set.name, "Position", Vector2.new(top.X, top.Y - 16))
+                            SetProp(set.name, "Color", col)
+                            SetProp(set.name, "Visible", true)
+                        else SetProp(set.name, "Visible", false) end
 
                         if State.ESPRole and label ~= "" then
-                            pcall(function()
-                                set.role.Text     = label
-                                set.role.Position = Vector2.new(top.X, bot.Y + 2)
-                                set.role.Color    = col
-                                set.role.Visible  = true
-                            end)
-                        else pcall(function() set.role.Visible = false end) end
+                            SetProp(set.role, "Text", label)
+                            SetProp(set.role, "Position", Vector2.new(top.X, bot.Y + 2))
+                            SetProp(set.role, "Color", col)
+                            SetProp(set.role, "Visible", true)
+                        else SetProp(set.role, "Visible", false) end
 
                         local drawLine = State.ESPLine
                         if drawLine and State.ESPOnlyRole and
@@ -1138,13 +892,11 @@ local function ESPStep()
                             drawLine = false
                         end
                         if drawLine then
-                            pcall(function()
-                                set.line.From    = Vector2.new(vw / 2, vh)
-                                set.line.To      = Vector2.new(top.X, bot.Y)
-                                set.line.Color   = col
-                                set.line.Visible = true
-                            end)
-                        else pcall(function() set.line.Visible = false end) end
+                            SetProp(set.line, "From", Vector2.new(vw / 2, vh))
+                            SetProp(set.line, "To", Vector2.new(top.X, bot.Y))
+                            SetProp(set.line, "Color", col)
+                            SetProp(set.line, "Visible", true)
+                        else SetProp(set.line, "Visible", false) end
                     end
                 end
             end
@@ -1158,6 +910,8 @@ local function ESPStep()
     roleCounts.murderer, roleCounts.sheriff, roleCounts.armed = mc, sc, ac
 end
 
+
+
 ------------------------------------------------------------------
 -- 8. UI LIBRARY
 ------------------------------------------------------------------
@@ -1169,8 +923,29 @@ do
 
     local function tryLoad(b)
         if type(b) ~= "string" or #b < 500 then return nil end
-        local ok, r = pcall(function() return loadstring(b)() end)
-        if ok and type(r) == "table" then return r end
+
+        -- Matcha-specific: loadstring() drops top-level return values.
+        -- INS-ui also publishes itself as global INSui / INSuiUI, so after
+        -- executing the chunk we must read the global instead of relying only
+        -- on `return Lib`.
+        local fn
+        local okCompile = pcall(function() fn = loadstring(b) end)
+        if not okCompile or type(fn) ~= "function" then return nil end
+
+        local okRun, r = pcall(function() return fn() end)
+        if okRun and type(r) == "table" then return r end
+
+        local g
+        pcall(function() g = INSui end)
+        if type(g) == "table" then return g end
+        pcall(function() g = _G and _G.INSui end)
+        if type(g) == "table" then return g end
+        pcall(function()
+            local env = getfenv and getfenv()
+            if type(env) == "table" then g = env.INSui end
+        end)
+        if type(g) == "table" then return g end
+
         return nil
     end
 
@@ -1207,12 +982,21 @@ end
 -- 9. CLEANUP GUARD (re-run safe, not a user button)
 ------------------------------------------------------------------
 
+-- Forward-declared here so the cleanup closure below removes the actual
+-- inventory window created later. A `local loadoutBox` declared after the
+-- closure would be a different variable and cleanup would silently miss it.
+local loadoutBox, loadoutLines = nil, {}
+
 local mainConn = nil
 
 _G.NadoMatchaCleanup = function()
     Running = false
-    pcall(function() mouse1release() end)
-    pcall(function() hudBg.Visible = false hudTxt.Visible = false hudDot.Visible = false end)
+    pcall(function()
+        if loadoutBox then
+            if loadoutBox.SetVisible then loadoutBox:SetVisible(false) end
+            if loadoutBox.Remove then loadoutBox:Remove() end
+        end
+    end)
     for _, set in pairs(espObjs) do
         for _, o in pairs(set) do pcall(function() o.Visible = false o:Remove() end) end
     end
@@ -1235,19 +1019,49 @@ end
     from outside the Roblox process.
 --]]
 
-local loadoutBox, loadoutLines = nil, {}
+-- loadoutBox/loadoutLines are forward-declared above so cleanup can see them.
 local BOX_ROWS = 20
-local lastBoxAt = 0
+local lastBoxAt = -math.huge
 
 local ROLE_ORDER = { murderer = 1, sheriff = 2, armed = 3, holding = 4, none = 5 }
+local INV_BOX_WIDTH, INV_BOX_MARGIN = 290, 20
+
+local function GetInventoryTopRightPos()
+    local vw, vh = 1920, 1080
+    pcall(function()
+        local vp = Workspace.CurrentCamera.ViewportSize
+        if vp and vp.X > 0 then vw, vh = vp.X, vp.Y end
+    end)
+    local bx = vw - INV_BOX_WIDTH - INV_BOX_MARGIN
+    if bx < INV_BOX_MARGIN then bx = INV_BOX_MARGIN end
+    return bx, INV_BOX_MARGIN
+end
+
+local function ForceLoadoutTopRight()
+    local bx, by = GetInventoryTopRightPos()
+    State.BoxX, State.BoxY = bx, by
+    pcall(function()
+        if loadoutBox and loadoutBox._box then
+            loadoutBox._box.x, loadoutBox._box.y = bx, by
+        end
+    end)
+    return bx, by
+end
 
 local function BuildLoadoutBox()
     if loadoutBox or not Lib then return end
+
+    -- Always start the inventory box in the top-right corner.
+    -- Saved BoxX/BoxY are ignored on purpose so an old off-screen config
+    -- cannot hide the window.
+    local bx, by = GetInventoryTopRightPos()
+    State.BoxX, State.BoxY = bx, by
+
     local ok = pcall(function()
         loadoutBox = Lib:CreateBox({
             title    = "INVENTORY",
-            position = Vector2.new(State.BoxX, State.BoxY),
-            width    = 290,
+            position = Vector2.new(bx, by),
+            width    = INV_BOX_WIDTH,
             visible  = false,
         })
     end)
@@ -1270,6 +1084,8 @@ local function LoadoutStep()
     if now - lastBoxAt < 0.3 then return end
     lastBoxAt = now
 
+    -- Keep it top-right every time it opens/refreshes.
+    ForceLoadoutTopRight()
     pcall(function() loadoutBox:SetVisible(true) end)
 
     local myPos
@@ -1424,160 +1240,12 @@ if Lib then
     ---------------------------------------------------------------
     -- COMBAT
     ---------------------------------------------------------------
-    local tabC = window:Tab("Combat", "home")
-    local sw = tabC:Section("Auto Swing", "Left", "real clicks + cooldown bypass")
-
-    UIRef.t.AutoSwing = sw:Toggle("Auto Swing", State.AutoSwing, function(v)
-        State.AutoSwing = v
-        if not v then pcall(function() mouse1release() end) end
-        SaveSettings()
-    end, "Matcha has no Tool:Activate(), so this sends real mouse clicks")
-    pcall(function() UIRef.t.AutoSwing:AddKeybind("f", "Toggle") end)
-
-    UIRef.t.CDBypass = sw:Toggle("Cooldown Bypass", State.CDBypass, function(v)
-        State.CDBypass = v
-        if not v then gcCache, gcHits = nil, 0 end
-        SaveSettings()
-    end, "Zeroes the weapon debounce inside the game's Lua GC")
-
-    UIRef.t.RequireTool = sw:Toggle("Only With Tool", State.RequireTool, function(v)
-        State.RequireTool = v SaveSettings()
-    end, "Do not click unless a Tool is in your hands")
-
-    UIRef.t.AutoEquip = sw:Toggle("Auto Equip", State.AutoEquip, function(v)
-        State.AutoEquip = v SaveSettings()
-    end, "Presses the 1 key when your hands are empty")
-
-    UIRef.t.NeedFocus = sw:Toggle("Require Window Focus", State.NeedFocus, function(v)
-        State.NeedFocus = v SaveSettings()
-    end, "Off by default: isrbxactive() is unreliable on some setups")
-
-    UIRef.t.ShowHUD = sw:Toggle("On-Screen Status", State.ShowHUD, function(v)
-        State.ShowHUD = v SaveSettings()
-    end, "Shows why swinging is paused while the menu is closed")
-
-    UIRef.t.KillAura = sw:Toggle("Kill Aura Mode", State.KillAura, function(v)
-        State.KillAura = v SaveSettings()
-    end, "Only swings when a player is in range. This is what stops the lag")
-
-    UIRef.t.MeleeOnly = sw:Toggle("Melee Only", State.MeleeOnly, function(v)
-        State.MeleeOnly = v SaveSettings()
-    end, "Do not spam clicks while holding a gun or launcher")
-
-    UIRef.t.AuraRange = sw:Slider("Aura Range", State.AuraRange, 1, 5, 60, "studs", function(v)
-        State.AuraRange = v SaveSettings()
-    end, "15 is the value used by the original script")
-
-    UIRef.t.SwingCPS = sw:Slider("Clicks Per Second", State.SwingCPS, 1, 1, 20, "", function(v)
-        State.SwingCPS = v SaveSettings()
-    end, "10-15 works best, faster is not always better")
-
-    UIRef.t.ClickHold = sw:Slider("Click Hold", State.ClickHold, 5, 5, 150, "ms", function(v)
-        State.ClickHold = v SaveSettings()
-    end, "How long the button stays down. Below ~20ms Roblox may ignore the click")
-
-    local dbg = tabC:Section("Diagnostics", "Right", "use these if nothing happens")
-
-    dbg:Button("Test 5 Clicks", function()
-        task.spawn(function()
-            pcall(function() Lib:SetOpen(false) end)
-            wait(0.6)
-            for _ = 1, 5 do
-                ClickOnce()
-                wait(0.15)
-            end
-            pcall(function()
-                Lib:Notify("Test", "5 clicks sent. Did the tool swing?", 6, "info")
-            end)
-        end)
-    end, "Closes the menu, waits, then sends 5 clean clicks")
-
-    dbg:Button("Why Is It Not Swinging?", function()
-        task.spawn(function()
-            local focused = true
-            pcall(function() focused = isrbxactive() end)
-            local tool = GetEquippedTool()
-            local hp   = GetHealth()
-
-            print("[Nado] ---- swing diagnostic ----")
-            print("[Nado] AutoSwing toggle : " .. tostring(State.AutoSwing))
-            print("[Nado] menu open        : " .. tostring(menuIsOpen()) .. "  (blocks input)")
-            print("[Nado] isrbxactive()    : " .. tostring(focused) ..
-                  "   enforced=" .. tostring(State.NeedFocus))
-            print("[Nado] tool detected    : " .. (tool and tool.Name or "NONE") ..
-                  "   enforced=" .. tostring(State.RequireTool))
-            print("[Nado] health           : " .. tostring(hp) ..
-                  "   readable=" .. tostring(healthReadable))
-            print("[Nado] click hold       : " .. State.ClickHold .. " ms")
-            print("[Nado] current status   : " .. swingStatus)
-
-            local why
-            if not State.AutoSwing then why = "Auto Swing is OFF"
-            elseif menuIsOpen() then why = "menu is open - it blocks game input"
-            elseif State.NeedFocus and not focused then why = "window not focused"
-            elseif State.RequireTool and not tool then why = "no tool detected - turn Only With Tool OFF"
-            elseif healthReadable and hp == 0 then why = "you are dead"
-            else why = "nothing is blocking it - if the weapon still does not swing, the cooldown is server-side" end
-
-            print("[Nado] VERDICT: " .. why)
-            pcall(function() Lib:Notify("Diagnostic", why, 8, "info") end)
-        end)
-    end, "Prints exactly which check is stopping the swing")
-
-    dbg:Button("Scan Cooldown Vars", function()
-        if type(getgc) ~= "function" then
-            pcall(function() Lib:Notify("Scan", "getgc missing in this build", 5, "warning") end)
-            return
-        end
-        task.spawn(function()
-            local ok, found = pcall(function() return getgc(CD_KEYS) end)
-            local n, seen = 0, {}
-            if ok and found then
-                for _, e in pairs(found) do
-                    n = n + 1
-                    if type(e) == "table" and e.key and not seen[tostring(e.key)] then
-                        seen[tostring(e.key)] = true
-                        print("[Nado][gc] " .. tostring(e.key) .. " = " ..
-                              tostring(e.value) .. "  (" .. tostring(e.type) .. ")")
-                    end
-                end
-            end
-            pcall(function()
-                Lib:Notify("Scan", n .. " cooldown values -- see console", 5,
-                           n > 0 and "success" or "warning")
-            end)
-        end)
-    end, "Prints every cooldown variable found, so you can confirm the bypass has targets")
-
-    dbg:Button("Dump Workspace", function()
-        task.spawn(function()
-            local ok, kids = pcall(function() return Workspace:GetChildren() end)
-            if ok and kids then
-                print("[Nado] ---- Workspace children ----")
-                for _, o in pairs(kids) do
-                    pcall(function() print("[Nado]  " .. o.Name .. "  (" .. o.ClassName .. ")") end)
-                end
-            end
-            local t = GetEquippedTool()
-            print("[Nado] equipped tool: " .. (t and t.Name or "none"))
-            pcall(function() Lib:Notify("Dump", "Workspace printed to console", 5, "info") end)
-        end)
-    end, "Prints the map layout so unknown event names can be added")
-
     ---------------------------------------------------------------
     -- EVENTS
     ---------------------------------------------------------------
     local tabE = window:Tab("Events", "activity")
 
     local haz = tabE:Section("Hazard Events", "Left", "auto react to round events")
-
-    UIRef.t.AntiLava = haz:Toggle("Anti-Lava", State.AntiLava, function(v)
-        State.AntiLava = v SaveSettings()
-    end, "'Watch out, the floor is lava' -- hovers you above the lava plate")
-
-    UIRef.t.AntiSweeper = haz:Toggle("Anti-Sweeper / Spin", State.AntiSweeper, function(v)
-        State.AntiSweeper = v SaveSettings()
-    end, "Sweeper beam, spinning plates and kill bricks")
 
     UIRef.t.AntiWater = haz:Toggle("Anti-Flood / Tsunami", State.AntiWater, function(v)
         State.AntiWater = v SaveSettings()
@@ -1587,57 +1255,17 @@ if Lib then
         State.AntiBomb = v SaveSettings()
     end, "Walks you out of bomb, nuke, mine and missile blast range")
 
-    UIRef.t.AntiFire = haz:Toggle("Anti-Fire", State.AntiFire, function(v)
-        State.AntiFire = v SaveSettings()
-    end, "Campfires and burning houses")
-
-    UIRef.t.AntiBees = haz:Toggle("Anti-Bees", State.AntiBees, function(v)
-        State.AntiBees = v SaveSettings()
-    end, "The beehive event")
-
     UIRef.t.AntiVoid = haz:Toggle("Anti-Void", State.AntiVoid, function(v)
         State.AntiVoid = v SaveSettings()
     end, "Pulls you back if you fall off the map")
 
-    local tune = tabE:Section("Reaction Tuning", "Right", "how it reacts")
+    UIRef.t.HoverHeight = haz:Slider("Hover Height", State.HoverHeight, 1, 4, 40, "studs", function(v)
+        State.HoverHeight = math.floor(v) SaveSettings()
+    end, "How high Anti-Water holds you above the danger")
 
-    UIRef.t.HoverHeight = tune:Slider("Hover Height", State.HoverHeight, 1, 4, 40, "studs", function(v)
-        State.HoverHeight = v SaveSettings()
-    end, "How high above lava/water/beam you float")
-
-    UIRef.t.PushDist = tune:Slider("Danger Radius", State.PushDist, 1, 8, 80, "studs", function(v)
-        State.PushDist = v SaveSettings()
-    end, "How far from bombs and fire you keep")
-
-    UIRef.t.ScanRate = tune:Slider("Scan Rate", State.ScanRate, 1, 1, 30, "/10s", function(v)
-        State.ScanRate = v SaveSettings()
-    end, "Higher reacts faster but costs more CPU")
-
-    UIRef.t.Noclip = tune:Toggle("Noclip", State.Noclip, function(v)
-        State.Noclip = v SaveSettings()
-    end, "Only resets on respawn")
-
-    local loot = tabE:Section("Auto Loot", "Right", "grab event drops")
-
-    UIRef.t.AutoLoot = loot:Toggle("Auto Loot", State.AutoLoot, function(v)
-        State.AutoLoot = v SaveSettings()
-    end, "Teleports to weapons and gear dropped by events")
-
-    UIRef.t.LootNote = loot:Toggle("Death Note", State.LootNote, function(v)
-        State.LootNote = v SaveSettings()
-    end, "'A powerful note falls from the sky'")
-
-    UIRef.t.LootWeapons = loot:Toggle("Weapons", State.LootWeapons, function(v)
-        State.LootWeapons = v SaveSettings()
-    end, "Swords, illumina, hammers, guns, flute")
-
-    UIRef.t.LootGear = loot:Toggle("Gear & Items", State.LootGear, function(v)
-        State.LootGear = v SaveSettings()
-    end, "Coils, totems, presents, chests, food")
-
-    UIRef.t.LootRange = loot:Slider("Loot Range", State.LootRange, 10, 50, 2000, "studs", function(v)
-        State.LootRange = v SaveSettings()
-    end)
+    UIRef.t.PushDist = haz:Slider("Bomb Keep Distance", State.PushDist, 1, 5, 80, "studs", function(v)
+        State.PushDist = math.floor(v) SaveSettings()
+    end, "How far Anti-Bomb tries to keep you from explosives")
 
     ---------------------------------------------------------------
     -- ESP
@@ -1685,41 +1313,16 @@ if Lib then
         State.BoxHideIdle = v SaveSettings()
     end, "Skip players with nothing at all")
 
-    local pl = tabP:Section("Detected", "Right", "live role scan")
-    pl:Label(function() return "Murderer:  " .. roleCounts.murderer end)
-    pl:Label(function() return "Sheriff:  "  .. roleCounts.sheriff  end)
-    pl:Label(function() return "Other armed:  " .. roleCounts.armed end)
-    pl:Label("")
-    pl:Label("Window legend:")
-    pl:Label("  >  item in their hands")
-    pl:Label("  -  item in their backpack")
-    pl:Label("")
-    pl:Label("Backpacks of OTHER players are")
-    pl:Label("often hidden by Roblox, so some")
-    pl:Label("show only the equipped item.")
-
-    ---------------------------------------------------------------
-    -- STATS
-    ---------------------------------------------------------------
-    local tabS = window:Tab("Stats", "activity")
-
-    local li = tabS:Section("Combat", "Left", "live")
-    li:Label(function() return "Tool:  " .. lastToolName end)
-    li:Label(function() return "Swings sent:  " .. swingCount end)
-    li:Label(function() return "Status:  " .. swingStatus end)
-    li:Label(function() return "Target:  " .. (auraTarget or "none in range") end)
-    li:Label(function()
-        if not State.CDBypass then return "Bypass:  off" end
-        return "Bypass:  " .. gcHits .. " values patched"
-    end)
-
-    local ev = tabS:Section("Events", "Right", "live")
-    ev:Label(function() return "Event status:  " .. eventStatus end)
-    ev:Label(function() return "Reactions:  " .. reactions end)
-    ev:Label(function() return "Hazards tracked:  " .. #dangerCache end)
-    ev:Label(function() return "Loot tracked:  " .. #lootCache end)
-    ev:Label(function() return "Loot:  " .. lootStatus .. "  (" .. lootGrabs .. ")" end)
-    ev:Label(function() return "Scan cost:  " .. scanCost .. " ms" end)
+    lb:Button("Move To Top Right", function()
+        ForceLoadoutTopRight()
+        pcall(function()
+            if loadoutBox and loadoutBox._box then loadoutBox._box.visible = true end
+        end)
+        State.LoadoutBox = true
+        pcall(function() UIRef.t.LoadoutBox:Set(true) end)
+        SaveSettings()
+        pcall(function() Lib:Notify("Inventory", "Window moved to the top right", 4, "info") end)
+    end, "Inventory now always opens in the top-right corner")
 
     ---------------------------------------------------------------
     -- SETTINGS
@@ -1736,23 +1339,16 @@ if Lib then
         pcall(function() Lib:Notify("Config", "Loaded", 3, "success") end)
     end)
     cfg:Button("Reset To Defaults", function()
-        State.AutoSwing, State.CDBypass                    = false, true
-        State.SwingCPS, State.ClickHold, State.AutoEquip   = 12, 35, false
-        State.KillAura, State.AuraRange, State.MeleeOnly   = true, 15, true
-        State.NeedFocus, State.ShowHUD                     = false, true
-        State.RequireTool                                  = false
-        State.AntiLava, State.AntiSweeper, State.AntiWater = false, false, false
-        State.AntiBomb, State.AntiFire, State.AntiBees     = false, false, false
-        State.AntiVoid, State.Noclip                       = false, false
-        State.HoverHeight, State.PushDist, State.ScanRate  = 12, 28, 10
-        State.AutoLoot, State.LootRange                    = false, 350
+        State.AntiWater, State.AntiBomb                  = false, false
+        State.AntiVoid                                  = false
+        State.HoverHeight, State.PushDist, State.ScanRate  = 12, 28, 4
+        State.ESPRate, State.LowSpec                       = 15, false
         State.RoleESP, State.ESPOnlyRole                   = false, false
         State.ESPBox, State.ESPName, State.ESPRole         = true, true, true
         State.ESPLine, State.ESPRange                      = false, 2000
         State.LoadoutBox, State.BoxSortRole                = false, true
         State.BoxHideIdle                                  = false
         -- Theme / ConfigName / AutoSaveUI intentionally preserved
-        State.LootWeapons, State.LootNote, State.LootGear  = true, true, true
         PushStateToUI() SaveSettings()
         pcall(function() Lib:Notify("Config", "Reset", 3, "info") end)
     end)
@@ -1829,18 +1425,6 @@ if Lib then
         end
     end, "Clears the cached UI library so the latest theme presets are downloaded")
 
-    local help = tabCfg:Section("If Swinging Does Nothing", "Right", "in order")
-    help:Label("1. Press Why Is It Not Swinging?")
-    help:Label("   It names the exact blocker.")
-    help:Label("2. CLOSE THE MENU. INS-ui blocks")
-    help:Label("   all game input while open.")
-    help:Label("3. Watch the on-screen status")
-    help:Label("   box once the menu is closed.")
-    help:Label("4. Raise Click Hold to 50-80ms.")
-    help:Label("")
-    help:Label("Lagging? Keep Kill Aura Mode ON")
-    help:Label("and Clicks Per Second near 12.")
-
     -- The library ships a full Theme tab (presets, accent pickers, rainbow,
     -- background FX, fonts, layout, configs). Enable it instead of reinventing it.
     pcall(function() window:AddSettingsTab("cog") end)
@@ -1858,56 +1442,103 @@ end
 -- 11. MAIN LOOP
 ------------------------------------------------------------------
 
-pcall(BuildHUD)
+-- no separate HUD builder in this build
 pcall(BuildESP)
 pcall(BuildLoadoutBox)
 -- ONE background worker instead of four separate timer threads.
 -- Fewer independent yields means far less scheduler churn inside Matcha.
 task.spawn(function()
     local tickN = 0
-    local lastScanAtW = 0
+    local lastScanAtW = -math.huge
     while Running do
         tickN = tickN + 1
 
         -- player cache: every pass (5 Hz) when something needs it
-        if State.RoleESP or State.AutoSwing or State.LoadoutBox then
-            pcall(RefreshPlayerInfo)
+        if State.RoleESP or State.LoadoutBox then
+            local slowDown = State.LowSpec or menuIsOpen()
+            if not (slowDown and tickN % 2 == 1) then
+                pcall(RefreshPlayerInfo)
+            end
         elseif #PlayerInfo > 0 then
             PlayerInfo = {}
         end
 
-        -- loot + loadout: every other pass (~2.5 Hz)
+        -- inventory window: every other pass (~2.5 Hz)
         if tickN % 2 == 0 then
-            pcall(LootStep)
             pcall(LoadoutStep)
         end
 
+        -- While the menu is open the library is busy tracking the cursor and
+        -- redrawing widgets. Running a full map scan in that window is what
+        -- made buttons need a second press, so heavy work waits.
+        local uiBusy = menuIsOpen()
+
         -- workspace hazard scan: on its own slower schedule
-        if AnyDangerOn() or State.AutoLoot then
+        if AnyDangerOn() and not uiBusy then
             local rate = State.ScanRate
             if rate < 1 then rate = 1 end
             if rate > 10 then rate = 10 end
             local due = 10 / rate
             local nowW = tick()
-            if nowW - lastScanAtW >= due then
-                lastScanAtW = nowW
+
+            -- If a scan is already in progress, continue the next chunk on
+            -- every worker tick. The old scheduler waited the full `due`
+            -- delay between chunks, so a large workspace could take 10+ sec
+            -- to publish hazards and Anti-Sweeper/Anti-Bomb felt dead.
+            if scanList or nowW - lastScanAtW >= due then
+                if not scanList then lastScanAtW = nowW end
                 pcall(ScanWorkspace)
+                if not scanList then lastScanAtW = tick() end
             end
-        elseif #dangerCache > 0 or #lootCache > 0 then
-            dangerCache, lootCache = {}, {}
+        elseif #dangerCache > 0 or scanList then
+            dangerCache, scanList, scanPos, scanAcc = {}, nil, 1, {}
         end
 
-        wait(0.2)
+        -- Idle much slower when nothing is enabled: 5 Hz of pointless
+        -- wakeups was a measurable chunk of the frame budget.
+        if State.RoleESP or State.LoadoutBox or AnyDangerOn() then
+            wait(0.2)
+        else
+            wait(1.0)
+        end
     end
 end)
 
-AutoSwingLoop()
+
+-- Master gate. When every visual/reactive feature is off there is nothing
+-- for the renderer to do, so we skip the whole frame with ONE table lookup
+-- instead of calling four functions that each re-check their own flags.
+local function NeedsFrame()
+    if State.RoleESP then return true end
+    if State.AntiVoid then return true end
+    if #dangerCache > 0 then return true end
+    return false
+end
+
+local idleFrames = 0
 
 local function Frame()
     if not Running then return end
+
+    -- Give the whole frame to the UI while it is open. ESP boxes behind a
+    -- fullscreen menu are not worth a single dropped click.
+    if menuIsOpen() then
+        if State.AntiVoid or #dangerCache > 0 then pcall(DangerStep) end
+        return
+    end
+
+    if not NeedsFrame() then
+        -- one tidy-up pass, then genuinely nothing
+        if idleFrames == 0 then
+            pcall(ESPStep)
+        end
+        idleFrames = idleFrames + 1
+        return
+    end
+    idleFrames = 0
+
+    -- these check their own flags and cost nothing when off
     pcall(DangerStep)
-    pcall(NoclipStep)
-    pcall(HUDStep)
     pcall(ESPStep)
 end
 
